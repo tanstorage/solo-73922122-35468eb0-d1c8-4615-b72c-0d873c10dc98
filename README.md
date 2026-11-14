@@ -11,6 +11,7 @@
 | 旧文件轮转后仍被短暂写入 | 旧 inode 继续按已提交偏移采集到 EOF；归档永不删除、不截断 |
 | 读到写了一半的行 | 只入仓以 `\n` 结尾的完整行；未换行尾部保持原偏移，下轮重读 |
 | 进程在写入中途/前后退出 | 行数据与“下一字节偏移”在**同一个 SQLite 事务**提交，重启从最后提交点续采 |
+| 停机时采集线程正在写库 | 停止信号后不再开新轮（后台与手动采集都拒绝）；当前轮只读到扫描时的大小、在完整行+事务边界收尾；**采集线程确实退出后才关闭连接** |
 | 查询读到半成品 | WAL + 事务隔离，查询只能看到已完整提交的事务 |
 | 内容相同的两行 | 唯一性只约束物理位置 `(dev,inode,source_code,byte_offset)`，不含内容，重复内容各自成行 |
 | JSON 坏行 | 隔离进 `malformed_lines` 表，不阻断后续行 |
@@ -26,8 +27,27 @@
 │   └── app/main.py         # API（/docs 可用）
 ├── nginx/                  # JSON 行日志格式 + 可控轮转脚本
 ├── traffic/                # 持续请求生成器（含 4xx/5xx）
-└── tests/                  # 41 项单元/集成断言 + 端到端模拟
+└── tests/                  # 63 项单元/集成断言 + 端到端模拟
 ```
+
+## 停机与维护（采集交接）
+
+`docker compose stop collector`（SIGTERM）触发优雅停机，四步交接：
+
+1. **不再开新轮**：后台循环在写锁内复查停止标志；`POST /ingest/poll-now`
+   在关闭开始后返回 `409`，不再启动新的采集轮次。
+2. **当前轮有界收尾**：每个文件一轮最多读到目录扫描时的大小——源文件持续
+   追加也不会让本轮不结束；收到停止信号后在下一个完整行边界提交事务
+   （行 + 偏移同一事务）并结束本轮。
+3. **线程退出后才关连接**：主线程 `join` 采集线程直到其**确实退出**，并拿到
+   写锁确认无在途手动采集，才做 WAL checkpoint 并关闭 SQLite——不会再出现
+   “连接已关闭仍在写”的错误。compose 中 `stop_grace_period: 30s` 只是兜底，
+   正常收尾为毫秒级。
+4. **重启精确续采**：已提交行不重记（偏移已同事务提交 + 唯一索引兜底），
+   未提交行不丢失（偏移未推进，重启后重读）。
+
+停机过程中 `/health` 与 `/ingest/progress` 的 `collector_running` /
+`collector_stopping` 字段实时反映采集线程状态，可在 `/docs` 页面观察。
 
 ## 快速开始
 
@@ -98,7 +118,7 @@ curl -s localhost:8000/malformed
 | --- | --- | --- |
 | GET | `/health` | 存活、计数、采集线程状态 |
 | GET | `/ingest/progress` | 各来源文件 offset/size/是否完成 |
-| POST | `/ingest/poll-now` | 立即执行一轮采集 |
+| POST | `/ingest/poll-now` | 立即执行一轮采集（关闭开始后返回 409） |
 | GET | `/events` | 分页取数，支持 `path`、`status`、`status_min/max`、`source_code`、`limit`、`offset` |
 | GET | `/events/{id}` | 单条事件（含原始 JSON 行 `raw_line`） |
 | GET | `/malformed` | 坏行隔离区 |
@@ -134,12 +154,14 @@ malformed_lines(..., raw_line, error)                            -- 坏行隔离
 python3 -m venv --without-pip .venv && . .venv/bin/activate
 # 若 venv 内无 pip：python get-pip.py
 pip install -r collector/requirements.txt httpx pyyaml
-python -I tests/test_collector.py   # 41 项：部分行/轮转/崩溃恢复/重复行/API
-python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 E2E
+python -I tests/test_collector.py   # 63 项：部分行/轮转/崩溃恢复/停机交接/重复行/API
+python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 + 维护停机 E2E
 ```
 
 覆盖的关键场景：未换行尾部等待补齐、rename 轮转双 inode、旧 inode 延迟写入、
-20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤。
+20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤、
+**停止信号后当前轮在完整行+事务边界收尾、持续追加中停机线程必退出、
+关闭后手动采集返回 409、维护停机后重启精确续采**。
 
 ## 故障排查
 

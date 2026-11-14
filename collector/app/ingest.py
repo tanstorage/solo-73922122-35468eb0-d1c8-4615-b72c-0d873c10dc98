@@ -15,6 +15,13 @@ Correctness model
    resumes from the last committed offset: no gaps, no duplicates.
 4. Rotated archives are never deleted or truncated; they are simply kept
    in the watched directory and drained to EOF once.
+5. Shutdown handoff: once stop is requested, no new poll pass starts —
+   neither the background loop nor a manual ``POST /ingest/poll-now``.
+   A pass already in flight reads each file only up to its scanned size
+   and, on stop, finishes at the next complete-line boundary and commits
+   its transaction, so every pass terminates even while sources keep
+   being appended. The DB connection is closed only after the collector
+   thread has really exited, so a writer never hits a closed connection.
 """
 
 from __future__ import annotations
@@ -27,14 +34,14 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import storage
 
 log = logging.getLogger("collector.ingest")
 
-# Read at most this many bytes per file per poll; partial tails are handled
-# on the next poll, so large files drain over successive ticks.
+# Files are read in chunks of this size. The stop flag is consulted between
+# chunks, so a shutdown request is honoured after at most one more chunk.
 READ_CHUNK = 1024 * 1024
 
 
@@ -135,10 +142,25 @@ def _normalise(parsed: dict[str, Any], raw: str) -> dict[str, Any]:
 class _Drained:
     complete_lines: list[tuple[int, str]]  # (absolute byte offset, raw line)
     next_offset: int
+    stopped_early: bool = False  # drain cut short by a stop request
 
 
-def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
+def drain_file(
+    path: str,
+    start_offset: int,
+    current_size: int,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> _Drained:
     """Read complete, newline-terminated lines starting at ``start_offset``.
+
+    Two bounds make every pass terminate, even while the source file keeps
+    being appended:
+
+    * reads never go past ``current_size`` (the size observed when the
+      directory was scanned) — bytes appended afterwards are left for the
+      next pass;
+    * when ``should_stop()`` reports True the drain halts before the next
+      read chunk, i.e. right after the last complete line.
 
     The returned ``next_offset`` never passes the last newline, so an
     unterminated tail is revisited on the next poll.
@@ -154,12 +176,27 @@ def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
         start_offset = 0
 
     fd = os.open(path, os.O_RDONLY)
+    stopped_early = False
     try:
         os.lseek(fd, start_offset, os.SEEK_SET)
         offset = start_offset
         carry = b""
         while True:
-            chunk = os.read(fd, READ_CHUNK)
+            if should_stop is not None and should_stop():
+                # Stop exactly after the last complete line; the unread
+                # remainder of the file is picked up after restart.
+                log.info(
+                    "stop requested; finishing %s at the last complete "
+                    "line (offset %d)", path, offset,
+                )
+                stopped_early = True
+                break
+            # Bytes already read from the file: consumed lines plus the
+            # unterminated tail still sitting in ``carry``.
+            read_pos = offset + len(carry)
+            if read_pos >= current_size:
+                break
+            chunk = os.read(fd, min(READ_CHUNK, current_size - read_pos))
             if not chunk:
                 break
             # Split on raw bytes: a decoded-character count is not a byte
@@ -181,12 +218,14 @@ def drain_file(path: str, start_offset: int, current_size: int) -> _Drained:
     finally:
         os.close(fd)
 
-    return _Drained(complete_lines=out, next_offset=offset)
+    return _Drained(complete_lines=out, next_offset=offset,
+                    stopped_early=stopped_early)
 
 
 def _process_file(
     conn: sqlite3.Connection,
     identity: FileIdentity,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> dict[str, Any]:
     state = storage.get_state(conn, identity.dev, identity.inode)
     if state is None:
@@ -207,9 +246,11 @@ def _process_file(
                      start_offset)
         if start_offset == identity.size:
             return {"source_code": identity.source_code, "ingested": 0,
-                    "malformed": 0, "offset": start_offset, "size": identity.size}
+                    "malformed": 0, "offset": start_offset,
+                    "size": identity.size, "stopped_early": False}
 
-    drained = drain_file(identity.path, start_offset, identity.size)
+    drained = drain_file(identity.path, start_offset, identity.size,
+                         should_stop=should_stop)
 
     ingested = 0
     malformed = 0
@@ -261,20 +302,38 @@ def _process_file(
         "malformed": malformed,
         "offset": drained.next_offset,
         "size": identity.size,
+        "stopped_early": drained.stopped_early,
     }
 
 
-def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
-    """One collection pass over every file currently in the directory."""
+def poll_once(
+    conn: sqlite3.Connection,
+    directory: str,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> dict[str, Any]:
+    """One collection pass over every file currently in the directory.
+
+    When ``should_stop()`` turns True the pass winds down: the file being
+    drained is finished at the last complete line and committed (rows and
+    offset in one transaction), and no further file is started.
+    """
     started = time.monotonic()
     files = list_log_files(directory)
     per_file: list[dict[str, Any]] = []
     total_ingested = 0
     total_malformed = 0
+    stopped_early = False
 
     for identity in files:
+        if should_stop is not None and should_stop():
+            stopped_early = True
+            log.info(
+                "stop requested; ending poll pass, %d file(s) not visited",
+                len(files) - len(per_file),
+            )
+            break
         try:
-            result = _process_file(conn, identity)
+            result = _process_file(conn, identity, should_stop=should_stop)
         except FileNotFoundError:
             # Rotated away between scan and open: next poll resolves it.
             log.info("file %s disappeared during scan", identity.source_code)
@@ -285,6 +344,14 @@ def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
         per_file.append(result)
         total_ingested += result["ingested"]
         total_malformed += result["malformed"]
+        # A drain cut short by a stop request ends the whole pass: the
+        # committed transaction is the clean boundary, remaining files
+        # wait for the next service run.
+        stopped_early = stopped_early or result["stopped_early"]
+        if stopped_early:
+            log.info("stop requested; poll pass ends after %s",
+                     identity.source_code)
+            break
 
     known = {(s["dev"], s["inode"]): s for s in storage.all_states(conn)}
     present = {(f.dev, f.inode) for f in files}
@@ -305,45 +372,65 @@ def poll_once(conn: sqlite3.Connection, directory: str) -> dict[str, Any]:
         "files_seen": len(files),
         "ingested": total_ingested,
         "malformed": total_malformed,
+        "stopped_early": stopped_early,
         "files": per_file,
     }
 
 
 class CollectorLoop:
+    """Background poll loop with a clean shutdown handoff.
+
+    ``request_stop()`` guarantees:
+    * no new poll pass starts afterwards (re-checked under the write lock);
+    * a pass in flight winds down at complete-line/transaction boundaries,
+      because the same predicate is threaded into :func:`poll_once`;
+    * the interruptible sleep ends immediately, so the thread exits
+      promptly and :meth:`threading.Thread.join` in the lifespan shutdown
+      only returns once this loop has really finished.
+    """
+
     def __init__(self, conn: sqlite3.Connection, directory: str,
                  interval: float = 0.5):
         self.conn = conn
         self.directory = directory
         self.interval = interval
-        self._stop = False
+        self._stop_event = threading.Event()
         # Serialises writers (background loop vs. POST /ingest/poll-now).
         self.write_lock = threading.Lock()
         self.last_result: Optional[dict[str, Any]] = None
         self.total_polls = 0
         self.total_ingested = 0
 
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
+
     def request_stop(self) -> None:
-        self._stop = True
+        self._stop_event.set()
 
     def run_forever(self) -> None:
         log.info("collector started on %s (interval=%ss)",
                  self.directory, self.interval)
-        while not self._stop:
+        while not self.should_stop():
             try:
                 with self.write_lock:
-                    result = poll_once(self.conn, self.directory)
+                    # Re-check under the lock: a stop requested while this
+                    # thread waited behind a manual poll must not start a
+                    # new pass.
+                    if self.should_stop():
+                        break
+                    result = poll_once(self.conn, self.directory,
+                                       should_stop=self.should_stop)
                 self.last_result = result
                 self.total_polls += 1
                 self.total_ingested += result["ingested"]
                 if result["ingested"]:
-                    log.info("poll #%s ingested %s line(s)",
-                             self.total_polls, result["ingested"])
+                    log.info("poll #%s ingested %s line(s)%s",
+                             self.total_polls, result["ingested"],
+                             " (stopped early)"
+                             if result["stopped_early"] else "")
             except Exception:
                 log.exception("poll failed; will retry")
-            # Interruptible sleep so SIGTERM shuts down promptly.
-            slept = 0.0
-            while slept < self.interval and not self._stop:
-                time.sleep(min(0.1, self.interval - slept))
-                slept += 0.1
+            # Interruptible sleep: wakes the instant stop is requested.
+            self._stop_event.wait(self.interval)
         log.info("collector stopped after %s polls, %s total lines",
                  self.total_polls, self.total_ingested)

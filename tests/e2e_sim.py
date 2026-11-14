@@ -195,9 +195,55 @@ def main():
                   {"access.log", "access.log.arc1.log"}
                   and all(f["complete"] for f in prog["files"]),
                   str(prog["files"]))
+
+        print("[F] 停机维护模拟：源文件持续追加中优雅停机")
+        stop_writer = threading.Event()
+        written = {"n": 0}
+
+        def writer():
+            # The source file keeps being appended while the maintenance
+            # shutdown begins — the incident scenario. Shutdown must not
+            # wait for the appends to stop, and must not lose them.
+            with open(cur, "a") as fh:
+                while not stop_writer.is_set():
+                    fh.write(jline(f"/maint/{written['n']}", 200))
+                    written["n"] += 1
+                    fh.flush()
+                    time.sleep(0.01)
+
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
+        time.sleep(0.3)           # appends in flight...
+        srv2.should_exit = True   # ...when the maintenance shutdown begins
+        t2.join(timeout=15)
+        stop_writer.set()
+        wt.join(timeout=5)
+        check("graceful shutdown completed while source kept being appended",
+              not t2.is_alive())
+
+        print("[G] 维护后重启：从已提交位置补采，已提交行不重记、未提交行不丢失")
+        srv3, t3 = start_server()
+        try:
+            post("/ingest/poll-now")
+            _, h = get("/health")
+            check("every line written before/during shutdown ingested once",
+                  h["counts"]["events"] == 44 + written["n"],
+                  f"{h['counts']['events']} != 44 + {written['n']}")
+            _, first = get("/events?path=/maint/0")
+            _, last = get(f"/events?path=/maint/{written['n'] - 1}")
+            check("maintenance lines present exactly once each",
+                  first["total"] == 1 and last["total"] == 1,
+                  f"first={first['total']} last={last['total']}")
+            _, prog = get("/ingest/progress")
+            check("all sources complete after post-maintenance resume",
+                  all(f["complete"] for f in prog["files"]),
+                  str(prog["files"]))
+        finally:
+            srv3.should_exit = True
+            t3.join(timeout=15)
     finally:
         srv2.should_exit = True
-        t2.join(timeout=10)
+        t2.join(timeout=15)
         arch_fh.close()
 
     print(f"\n==== E2E {'ALL PASS' if not failures else f'{len(failures)} FAIL'} ====")

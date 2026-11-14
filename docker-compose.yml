@@ -30,6 +30,9 @@ services:
       LOG_DIR: /logs
       POLL_INTERVAL: "0.5"
       LOG_LEVEL: INFO
+    # 停机交接：SIGTERM 后采集线程在完整行/事务边界收尾并退出，
+    # 连接随后才关闭。正常收尾为毫秒级，30s 宽限只是兜底。
+    stop_grace_period: 30s
     volumes:
       # 题目要求：采集共享只读目录中的日志
       - nginx_json_logs:/logs:ro

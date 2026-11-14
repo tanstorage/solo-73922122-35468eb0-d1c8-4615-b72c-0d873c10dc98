@@ -360,6 +360,9 @@ def test_api():
             time.sleep(0.1)
         check("background ingestion visible via /health",
               h["counts"]["events"] == 33, str(h["counts"]))
+        check("health reports collector thread running, not stopping",
+              h["collector_running"] is True
+              and h["collector_stopping"] is False, str(h))
 
         prog = json.load(urllib.request.urlopen(
             "http://127.0.0.1:8765/ingest/progress"))
@@ -493,6 +496,181 @@ def test_multibyte_offsets_and_chunk_boundaries():
         shutil.rmtree(base)
 
 
+def test_stop_finishes_at_line_boundary():
+    print("\n[10] 停机交接：停止信号后当前轮在完整行+事务边界收尾")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        lines = [jline(f"/stop/{i}", 200 if i % 3 else 500) for i in range(200)]
+        with open(f, "w") as fh:
+            fh.writelines(lines)
+
+        import app.ingest as ingest_mod
+        original_chunk = ingest_mod.READ_CHUNK
+        # Small chunks: the stop flag is consulted between chunks, so the
+        # pass must halt almost immediately after the flag flips.
+        ingest_mod.READ_CHUNK = 256
+        try:
+            calls = {"n": 0}
+
+            def stop_after_first_chunk():
+                calls["n"] += 1
+                # call 1: poll_once file-loop guard -> keep going
+                # call 2: drain_file before chunk 1 -> keep going
+                # call 3: drain_file before chunk 2 -> stop
+                return calls["n"] > 2
+
+            r = poll_once(conn, log_dir, should_stop=stop_after_first_chunk)
+        finally:
+            ingest_mod.READ_CHUNK = original_chunk
+
+        check("pass reports it stopped early", r["stopped_early"] is True)
+        check("some lines committed, the rest deferred",
+              0 < r["ingested"] < 200, f"ingested={r['ingested']}")
+        st = storage.all_states(conn)[0]
+        boundary = sum(len(lines[i].encode()) for i in range(r["ingested"]))
+        check("committed offset sits exactly on a complete-line boundary",
+              st["offset"] == boundary,
+              f"offset={st['offset']} boundary={boundary}")
+        n = conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("warehouse rows == committed lines", n == r["ingested"])
+
+        # Resume: a normal pass picks up every remaining line exactly once.
+        r2 = poll_once(conn, log_dir)
+        check("resume ingests exactly the remainder",
+              r2["ingested"] == 200 - r["ingested"])
+        n = conn.execute("SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("no line lost, none duplicated", n == 200, f"n={n}")
+        paths = [row["path"] for row in conn.execute(
+            "SELECT path FROM log_events ORDER BY id").fetchall()]
+        check("final row order matches the source file",
+              paths == [f"/stop/{i}" for i in range(200)])
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_drain_capped_at_scanned_size():
+    print("\n[11] 轮次有界：扫描后追加的字节留给下一轮，持续追加也能收尾")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        f = os.path.join(log_dir, "access.log")
+        with open(f, "w") as fh:
+            fh.writelines(jline(f"/snap/{i}", 200) for i in range(10))
+        size_snapshot = os.path.getsize(f)
+        # Bytes appended AFTER the directory snapshot must not extend the
+        # current pass — this is what makes every pass terminate even while
+        # the source file keeps growing.
+        with open(f, "a") as fh:
+            fh.writelines(jline(f"/late/{i}", 200) for i in range(5))
+
+        drained = drain_file(f, 0, size_snapshot)
+        check("drain stops at the scanned size",
+              drained.next_offset == size_snapshot,
+              f"{drained.next_offset} != {size_snapshot}")
+        check("only the 10 snapshot lines returned",
+              len(drained.complete_lines) == 10,
+              str(len(drained.complete_lines)))
+        drained2 = drain_file(f, drained.next_offset, os.path.getsize(f))
+        check("late bytes are picked up from the committed offset next pass",
+              len(drained2.complete_lines) == 5
+              and drained2.next_offset == os.path.getsize(f))
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_loop_thread_exits_promptly_on_stop():
+    print("\n[12] 采集线程：持续追加中停止 -> 线程退出、不再开新轮、重启续采不漏不重")
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        loop_conn = storage.connect(db_path)
+        loop = CollectorLoop(loop_conn, log_dir, interval=0.05)
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
+
+        f = os.path.join(log_dir, "access.log")
+        stop_writing = threading.Event()
+        written = {"n": 0}
+
+        def writer():
+            # The source file keeps being appended while shutdown begins —
+            # the maintenance-window scenario from the incident report.
+            with open(f, "a") as fh:
+                while not stop_writing.is_set():
+                    fh.write(jline(f"/live/{written['n']}", 200))
+                    written["n"] += 1
+                    fh.flush()
+                    time.sleep(0.005)
+
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
+        try:
+            time.sleep(0.5)  # several passes run under continuous appends
+            polls_before = loop.total_polls
+            loop.request_stop()
+            t.join(timeout=10)
+            check("collector thread exited after stop request",
+                  not t.is_alive())
+            check("no new pass started after stop",
+                  loop.total_polls <= polls_before + 1,
+                  f"before={polls_before} after={loop.total_polls}")
+        finally:
+            stop_writing.set()
+            wt.join(timeout=5)
+
+        # The connection outlives the thread: main.py closes it only after
+        # the collector thread has exited, so this read is always safe.
+        n_committed = loop_conn.execute(
+            "SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("committed rows satisfy the exactly-once position constraint",
+              loop_conn.execute(
+                  "SELECT COUNT(*) c FROM (SELECT DISTINCT dev,inode,source_code,byte_offset FROM log_events)"
+              ).fetchone()["c"] == n_committed)
+
+        # Restart-style resume from the committed position: nothing lost.
+        poll_once(loop_conn, log_dir)
+        total = loop_conn.execute(
+            "SELECT COUNT(*) c FROM log_events").fetchone()["c"]
+        check("resume after stop loses no line and adds no duplicate",
+              total == written["n"],
+              f"total={total} written={written['n']}")
+        loop_conn.close()
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
+def test_manual_poll_rejected_after_stop():
+    print("\n[13] 关闭开始后：手动采集返回 409，不再启动新轮次")
+    # app.main was already imported by test_api, so its path constants are
+    # fixed; only the shared `state` needs to point at this test's objects.
+    base, log_dir, db_path, conn = fresh_env()
+    try:
+        from fastapi import HTTPException
+        from app.main import poll_now, state
+
+        loop = CollectorLoop(conn, log_dir, interval=0.05)
+        state.update(conn=conn, loop=loop)
+        try:
+            r = poll_now()
+            check("manual poll runs while the service is up",
+                  r["ingested"] == 0 and r["stopped_early"] is False)
+            loop.request_stop()
+            try:
+                poll_now()
+                check("manual poll rejected once shutdown begins", False,
+                      "no exception raised")
+            except HTTPException as exc:
+                check("manual poll rejected once shutdown begins",
+                      exc.status_code == 409, f"status={exc.status_code}")
+        finally:
+            state.clear()
+    finally:
+        conn.close()
+        shutil.rmtree(base)
+
+
 if __name__ == "__main__":
     test_drain_partial_tail()
     test_rotation_rename()
@@ -503,5 +681,9 @@ if __name__ == "__main__":
     test_api()
     test_offset_math_after_partial()
     test_multibyte_offsets_and_chunk_boundaries()
+    test_stop_finishes_at_line_boundary()
+    test_drain_capped_at_scanned_size()
+    test_loop_thread_exits_promptly_on_stop()
+    test_manual_poll_rejected_after_stop()
     print(f"\n==== {PASS} passed, {FAIL} failed ====")
     sys.exit(1 if FAIL else 0)

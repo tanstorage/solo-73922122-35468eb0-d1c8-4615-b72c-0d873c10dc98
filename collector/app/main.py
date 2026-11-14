@@ -42,6 +42,7 @@ class Health(BaseModel):
     db_path: str
     poll_interval_seconds: float
     collector_running: bool
+    collector_stopping: bool
     total_polls: int
     total_ingested: int
     counts: dict
@@ -60,6 +61,7 @@ class FileProgress(BaseModel):
 
 class ProgressResponse(BaseModel):
     collector_running: bool
+    collector_stopping: bool
     total_polls: int
     total_ingested: int
     last_poll: Optional[dict] = None
@@ -107,15 +109,29 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Shutdown handoff (停机交接):
+        # 1. request_stop() makes the loop refuse new passes and winds the
+        #    in-flight pass down at complete-line/transaction boundaries.
+        #    Passes are bounded (files drain only up to their scanned
+        #    size), so the collector thread always exits.
+        # 2. Only after the thread has really exited — and no manual poll
+        #    holds the write lock — is the connection checkpointed/closed.
+        #    A writer therefore never hits a closed connection.
         log.info("shutdown requested, stopping collector loop...")
         loop.request_stop()
-        thread.join(timeout=10)
-        # A checkpoint persists WAL frames into the main db file on exit.
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            log.exception("checkpoint on shutdown failed")
-        conn.close()
+        while True:
+            thread.join(timeout=2)
+            if not thread.is_alive():
+                break
+            log.info("collector still finishing its current pass; waiting...")
+        log.info("collector thread exited; closing database connection")
+        with loop.write_lock:
+            # A checkpoint persists WAL frames into the main db file on exit.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                log.exception("checkpoint on shutdown failed")
+            conn.close()
         log.info("shutdown complete")
 
 
@@ -142,7 +158,8 @@ def health():
         log_dir=LOG_DIR,
         db_path=DB_PATH,
         poll_interval_seconds=POLL_INTERVAL,
-        collector_running=threading.main_thread().is_alive() and not loop._stop,
+        collector_running=state["thread"].is_alive(),
+        collector_stopping=loop.should_stop(),
         total_polls=loop.total_polls,
         total_ingested=loop.total_ingested,
         counts=storage.counts(_conn()),
@@ -180,7 +197,8 @@ def progress():
             last_seen=row["last_seen"],
         ))
     return ProgressResponse(
-        collector_running=not loop._stop,
+        collector_running=state["thread"].is_alive(),
+        collector_stopping=loop.should_stop(),
         total_polls=loop.total_polls,
         total_ingested=loop.total_ingested,
         last_poll=loop.last_result,
@@ -191,10 +209,22 @@ def progress():
 
 @app.post("/ingest/poll-now", tags=["ingest"])
 def poll_now():
-    """Force an immediate scan/ingest pass (useful for tests/demos)."""
+    """Force an immediate scan/ingest pass (useful for tests/demos).
+
+    Once shutdown has begun no new pass is started: the endpoint answers
+    409 and leaves the in-flight pass to wind down on its own.
+    """
     loop: CollectorLoop = state["loop"]
+    if loop.should_stop():
+        raise HTTPException(status_code=409,
+                            detail="服务正在关闭，不再启动新的采集轮次")
     with loop.write_lock:
-        return poll_once(_conn(), LOG_DIR)
+        # Re-check under the lock: shutdown may have begun while this
+        # request waited behind the background pass.
+        if loop.should_stop():
+            raise HTTPException(status_code=409,
+                                detail="服务正在关闭，不再启动新的采集轮次")
+        return poll_once(_conn(), LOG_DIR, should_stop=loop.should_stop)
 
 
 @app.get("/events", response_model=EventPage, tags=["query"])
